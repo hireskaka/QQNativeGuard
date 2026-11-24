@@ -1389,9 +1389,19 @@ static const char* fake_prop_value(const char* name) {
     if (strcmp(name, "ro.boot.selinux") == 0) return "enforcing";
     // 【V7 修复】SoC / 平台标识 —— OPPO Find X7 = 骁龙 8 Gen 3 (SM8650)
     // 真机是 lahaina (SM8350/骁龙888)，必须同步换，否则 k54 与 k57(PGT110) 矛盾
-    if (strcmp(name, "ro.board.platform") == 0 ||
+    // 【V9 关键修复】QsecEst 的 k54 来自 ro.product.board，不是 ro.board.platform。
+    // 之前只覆盖后者，导致 k54 一直报真机 "lahaina"，与伪造机型 PGT110 矛盾。
+    // 这两个是不同的属性，必须都覆盖。
+    if (strcmp(name, "ro.product.board") == 0 ||
+        strcmp(name, "ro.product.vendor.board") == 0 ||
+        strcmp(name, "ro.product.system.board") == 0 ||
+        strcmp(name, "ro.product.odm.board") == 0 ||
+        strcmp(name, "ro.product.product.board") == 0 ||
+        strcmp(name, "ro.board.platform") == 0 ||
         strcmp(name, "ro.chipname") == 0 ||
-        strcmp(name, "ro.hardware.chipname") == 0) return "kalama";
+        strcmp(name, "ro.hardware.chipname") == 0) {
+        return "kalama";
+    }
     if (strcmp(name, "ro.soc.model") == 0) return "SM8650";
     if (strcmp(name, "ro.soc.manufacturer") == 0) return "Qualcomm";
     if (strcmp(name, "ro.soc.platform") == 0) return "kalama";
@@ -2203,6 +2213,9 @@ void install_hooks() {
             char socbuf2[64] = {0};
             __system_property_get("ro.board.platform", socbuf2);
             LOGI("Self-test ro.board.platform='%s' (fake target='kalama')", socbuf2);
+            char pb[64] = {0};
+            __system_property_get("ro.product.board", pb);
+            LOGI("Self-test ro.product.board='%s' (fake target='kalama')", pb);
             char socm[64] = {0};
             __system_property_get("ro.soc.model", socm);
             LOGI("Self-test ro.soc.model='%s' (fake target='SM8650')", socm);
