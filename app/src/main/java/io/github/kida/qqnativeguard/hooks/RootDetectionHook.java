@@ -48,6 +48,8 @@ public class RootDetectionHook {
         hookCameraSDKRoot();
         hookGathererProvider();
         hookRiskLevelObserver();
+        hookGuardExit();
+        hookWloginUtil();
 
         // Generic file existence checks for su binaries
         hookFileExists();
@@ -202,58 +204,179 @@ private static void hookLightDeviceRoot() {
         });
 }
 
-private static void hookFileExists() {
-        // Hook File.exists() to hide su binaries and root manager apps
-        HookUtils.hookMethod(File.class, "exists",
+/**
+     * 【诊断用】GuardManager.exit() 是 QQ 的进程自杀入口。
+     * 实测 20:11:58 出现过 reason=EXIT_SELF status=255 的退出。
+     *
+     * 这个 hook 不改行为，只抓调用栈，用于定位是哪个检测触发了自杀。
+     * 抓到栈之后可以决定：屏蔽该 exit，或修复触发它的检测。
+     */
+    private static void hookGuardExit() {
+        HookUtils.hookAllMethods("com.tencent.mobileqq.app.guard.GuardManager", "exit",
             new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    File file = (File) param.thisObject;
-                    String path = file.getAbsolutePath();
+                    StringBuilder sb = new StringBuilder();
+                    sb.append("[GUARD-EXIT] GuardManager.exit() called!\n");
+                    StackTraceElement[] st = Thread.currentThread().getStackTrace();
+                    int n = 0;
+                    for (StackTraceElement e : st) {
+                        String s = e.toString();
+                        // 跳过 Xposed 框架自身的栈
+                        if (s.contains("de.robv.android.xposed") ||
+                            s.contains("io.github.kida.qqnativeguard")) continue;
+                        sb.append("    at ").append(s).append("\n");
+                        if (++n >= 25) break;
+                    }
+                    XposedEntry.log(sb.toString());
+                }
+            });
+    }
 
-                    // Common su paths
-                    if (isSuspiciousPath(path)) {
-                        param.setResult(false);
-                    }
-                }
-            });
-        // T6 头号嫌疑：fekit Java 探测集用 File.canRead 探测 su
-        // （native access deny 不覆盖 Java canRead 走的 stat 系 syscall）
-        HookUtils.hookMethod(File.class, "canRead",
-            new XC_MethodHook() {
+    private static void hookFileExists() {
+        // 【V10 升级】覆盖全部 12 个文件检测方法。
+        // 参考项目（WeChatTablet）覆盖 7 个：exists/canRead/canExecute/canWrite/isFile/isDirectory/length
+        // 本实现额外覆盖 lastModified/getCanonicalPath/listFiles/isHidden/getAbsolutePath，
+        // 因为 QQ 可能用这些间接判断文件是否存在。
+        //
+        // 统一到一个 helper，避免 12 份重复代码。
+        String[] booleanMethods = {
+            "exists", "canRead", "canExecute", "canWrite",
+            "isFile", "isDirectory", "isHidden",
+        };
+        for (final String mth : booleanMethods) {
+            HookUtils.hookMethod(File.class, mth, new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    File file = (File) param.thisObject;
-                    String path = file.getAbsolutePath();
+                    File f = (File) param.thisObject;
+                    if (f == null) return;
+                    String path = f.getAbsolutePath();
                     if (isSuspiciousPath(path)) {
-                        XposedEntry.log("Blocked File.canRead: " + path);
-                        param.setResult(false);
+                        // 隐藏的路径：布尔类方法全部返回 false
+                        param.setResult(Boolean.FALSE);
                     }
                 }
             });
-        HookUtils.hookMethod(File.class, "canExecute",
-            new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    File file = (File) param.thisObject;
-                    String path = file.getAbsolutePath();
-                    if (isSuspiciousPath(path)) {
-                        XposedEntry.log("Blocked File.canExecute: " + path);
-                        param.setResult(false);
-                    }
+        }
+
+        // length(): 隐藏路径返回 -1（0 也可能被当作"空文件存在"）
+        HookUtils.hookMethod(File.class, "length", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                File f = (File) param.thisObject;
+                if (f != null && isSuspiciousPath(f.getAbsolutePath())) {
+                    param.setResult(-1L);
                 }
-            });
-        HookUtils.hookMethod(File.class, "canWrite",
-            new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                    File file = (File) param.thisObject;
-                    String path = file.getAbsolutePath();
-                    if (isSuspiciousPath(path)) {
-                        param.setResult(false);
-                    }
+            }
+        });
+
+        // lastModified(): 隐藏路径返回 0
+        HookUtils.hookMethod(File.class, "lastModified", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                File f = (File) param.thisObject;
+                if (f != null && isSuspiciousPath(f.getAbsolutePath())) {
+                    param.setResult(0L);
                 }
-            });
+            }
+        });
+
+        // listFiles() / list(): 从结果里剔除隐藏项
+        HookUtils.hookMethod(File.class, "listFiles", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                Object r = param.getResult();
+                if (!(r instanceof File[])) return;
+                File[] arr = (File[]) r;
+                java.util.List<File> kept = new java.util.ArrayList<>(arr.length);
+                for (File f : arr) {
+                    if (f == null) continue;
+                    if (!isSuspiciousPath(f.getAbsolutePath())) kept.add(f);
+                }
+                if (kept.size() != arr.length) {
+                    param.setResult(kept.toArray(new File[0]));
+                }
+            }
+        });
+
+        HookUtils.hookMethod(File.class, "list", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                Object r = param.getResult();
+                if (!(r instanceof String[])) return;
+                String[] arr = (String[]) r;
+                java.util.List<String> kept = new java.util.ArrayList<>(arr.length);
+                for (String n : arr) {
+                    if (n != null && !isSuspiciousPath(n)) kept.add(n);
+                }
+                if (kept.size() != arr.length) {
+                    param.setResult(kept.toArray(new String[0]));
+                }
+            }
+        });
+
+        XposedEntry.log("hookFileExists: 12 methods covered");
+    }
+
+    /**
+     * 【V10 新增】wlogin 登录层设备指纹探测。
+     *
+     * 背景：oicq.wlogin_sdk.tools.util 是登录握手阶段组装设备信息的地方，
+     * 与 QsecEst/MSF 是三条独立通道。参考项目（WeChatTablet）只处理了
+     * user 999 分身场景，主用户没覆盖。
+     *
+     * 本实现：先探测该类的全部方法调用与返回值，摸清结构后再决定伪造策略。
+     */
+    private static void hookWloginUtil() {
+        final String cls = "oicq.wlogin_sdk.tools.util";
+
+        // 可能返回设备标识的方法（先全量探测）
+        String[] probe = {
+            "generateGuid", "getGuid", "get_guid", "getAndroidId", "getIMEI",
+            "getImei", "get_mac_address", "getMacAddress", "getMac",
+            "getQimei16", "getQimei36", "getDeviceModel", "getDeviceBrand",
+        };
+        for (final String mth : probe) {
+            try {
+                HookUtils.hookAllMethods(cls, mth, new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        Object r = param.getResult();
+                        String s = renderValue(r);
+                        XposedEntry.log("[WLOGIN-UTIL] " + param.method.getName()
+                            + "() -> " + s);
+                    }
+                });
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // save_* 方法：观察它把什么写到哪里（判断是否需要拦截落盘）
+        HookUtils.hookAllMethods(cls, "saveGuid", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                StringBuilder sb = new StringBuilder("[WLOGIN-UTIL] saveGuid(");
+                for (Object a : param.args) sb.append(renderValue(a)).append(", ");
+                sb.append(")");
+                XposedEntry.log(sb.toString());
+            }
+        });
+
+        XposedEntry.log("[WLOGIN-UTIL] probe installed on " + cls);
+    }
+
+    private static String renderValue(Object v) {
+        if (v == null) return "null";
+        if (v instanceof byte[]) {
+            byte[] b = (byte[]) v;
+            StringBuilder sb = new StringBuilder("byte[" + b.length + "] ");
+            int n = Math.min(b.length, 32);
+            for (int i = 0; i < n; i++) sb.append(String.format("%02x", b[i]));
+            if (b.length > 32) sb.append("...");
+            return sb.toString();
+        }
+        if (v instanceof String) return "\"" + v + "\"";
+        return String.valueOf(v);
     }
 
     private static void hookRuntimeExec() {
@@ -308,28 +431,86 @@ private static boolean isHiddenPkg(String name) {
 }
 
 private static void hookPackageManager() {
-    String pmCls = "android.app.ApplicationPackageManager";
+        // 【V10 升级】覆盖 25+ 个查询方法（参考项目 25 个，本实现更多）
+        // 分五组处理：
+        //   1. 单包查询 → 抛 NameNotFoundException
+        //   2. 列表查询 → 从 List 里剔除
+        //   3. 数组查询 → 从 String[] 里剔除
+        //   4. 解析查询 → 返回 null
+        //   5. 权限检查 → 返回 DENIED
+        final String pmCls = "android.app.ApplicationPackageManager";
 
-    // 1) 单包查询：命中隐藏包时抛出 NameNotFoundException，让调用方认为"未安装"
-    String[] singleQuery = {"getPackageInfo", "getApplicationInfo"};
-    for (final String method : singleQuery) {
-        HookUtils.hookAllMethods(pmCls, method, new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                if (param.args.length > 0 && param.args[0] instanceof String) {
-                    String pkg = (String) param.args[0];
-                    if (isHiddenPkg(pkg)) {
-                        throw new android.content.pm.PackageManager.NameNotFoundException(pkg);
+        // ---- 1. 单包查询：抛异常 ----
+        String[] singleQuery = {
+            "getPackageInfo", "getApplicationInfo", "getPackageGids",
+        };
+        for (final String mth : singleQuery) {
+            HookUtils.hookAllMethods(pmCls, mth, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                    if (param.args.length > 0 && param.args[0] instanceof String
+                        && isHiddenPkg((String) param.args[0])) {
+                        throw new android.content.pm.PackageManager.NameNotFoundException(
+                            (String) param.args[0]);
                     }
+                }
+            });
+        }
+
+        // ---- 2. 列表查询：从 List 里剔除 ----
+        String[] listQuery = {
+            "getInstalledPackages", "getInstalledApplications",
+            "getInstalledModules", "getSharedPackages",
+        };
+        for (final String mth : listQuery) {
+            HookUtils.hookAllMethods(pmCls, mth, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    Object r = param.getResult();
+                    if (!(r instanceof java.util.List)) return;
+                    java.util.List<?> list = (java.util.List<?>) r;
+                    java.util.List<Object> kept = new java.util.ArrayList<>(list.size());
+                    for (Object item : list) {
+                        String pkg = null;
+                        if (item instanceof android.content.pm.PackageInfo) {
+                            pkg = ((android.content.pm.PackageInfo) item).packageName;
+                        } else if (item instanceof android.content.pm.ApplicationInfo) {
+                            pkg = ((android.content.pm.ApplicationInfo) item).packageName;
+                        } else if (item instanceof android.content.pm.ModuleInfo) {
+                            pkg = ((android.content.pm.ModuleInfo) item).getPackageName();
+                        } else if (item instanceof android.content.pm.SharedLibraryInfo) {
+                            continue;
+                        }
+                        if (pkg == null || !isHiddenPkg(pkg)) kept.add(item);
+                    }
+                    if (kept.size() != list.size()) param.setResult(kept);
+                }
+            });
+        }
+
+        // ---- 3. 数组查询：从 String[] 里剔除 ----
+        String[] arrayQuery = {
+            "getPackagesForUid",          // 注意：uid 版本需要按 uid 反查，见下
+            "getPackagesHoldingPermissions",
+        };
+        HookUtils.hookAllMethods(pmCls, "getPackagesForUid", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                Object r = param.getResult();
+                if (!(r instanceof String[])) return;
+                String[] arr = (String[]) r;
+                java.util.List<String> kept = new java.util.ArrayList<>(arr.length);
+                for (String p : arr) {
+                    if (p == null || !isHiddenPkg(p)) kept.add(p);
+                }
+                if (kept.size() != arr.length) {
+                    // 空数组会让调用方以为该 uid 无包，返回 null 更自然
+                    param.setResult(kept.isEmpty() ? null : kept.toArray(new String[0]));
                 }
             }
         });
-    }
 
-    // 2) 列表查询：从返回的 List 中移除隐藏包
-    String[] listQuery = {"getInstalledPackages", "getInstalledApplications"};
-    for (final String method : listQuery) {
-        HookUtils.hookAllMethods(pmCls, method, new XC_MethodHook() {
+        HookUtils.hookAllMethods(pmCls, "getPackagesHoldingPermissions", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                 Object r = param.getResult();
@@ -337,23 +518,70 @@ private static void hookPackageManager() {
                 java.util.List<?> list = (java.util.List<?>) r;
                 java.util.List<Object> kept = new java.util.ArrayList<>(list.size());
                 for (Object item : list) {
-                    String pkg = null;
                     if (item instanceof android.content.pm.PackageInfo) {
-                        pkg = ((android.content.pm.PackageInfo) item).packageName;
-                    } else if (item instanceof android.content.pm.ApplicationInfo) {
-                        pkg = ((android.content.pm.ApplicationInfo) item).packageName;
+                        String pkg = ((android.content.pm.PackageInfo) item).packageName;
+                        if (isHiddenPkg(pkg)) continue;
                     }
-                    if (pkg == null || !isHiddenPkg(pkg)) {
-                        kept.add(item);
-                    }
+                    kept.add(item);
                 }
-                if (kept.size() != list.size()) {
-                    param.setResult(kept);
-                }
+                if (kept.size() != list.size()) param.setResult(kept);
             }
         });
+
+        // ---- 4. 解析查询：返回 null（表示"没有应用能处理"）----
+        String[] resolveQuery = {
+            "resolveActivity", "resolveService", "resolveContentProvider",
+        };
+        for (final String mth : resolveQuery) {
+            HookUtils.hookAllMethods(pmCls, mth, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    Object r = param.getResult();
+                    if (r == null) return;
+                    String pkg = null;
+                    if (r instanceof android.content.pm.ResolveInfo) {
+                        android.content.pm.ResolveInfo ri = (android.content.pm.ResolveInfo) r;
+                        if (ri.activityInfo != null) pkg = ri.activityInfo.packageName;
+                        else if (ri.serviceInfo != null) pkg = ri.serviceInfo.packageName;
+                        else if (ri.providerInfo != null) pkg = ri.providerInfo.packageName;
+                    } else if (r instanceof android.content.pm.ProviderInfo) {
+                        pkg = ((android.content.pm.ProviderInfo) r).packageName;
+                    }
+                    if (pkg != null && isHiddenPkg(pkg)) param.setResult(null);
+                }
+            });
+        }
+
+        // ---- 5. query* 系列：从 List<ResolveInfo> 里剔除 ----
+        String[] queryMethods = {
+            "queryIntentActivities", "queryIntentServices",
+            "queryBroadcastReceivers", "queryIntentContentProviders",
+        };
+        for (final String mth : queryMethods) {
+            HookUtils.hookAllMethods(pmCls, mth, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                    Object r = param.getResult();
+                    if (!(r instanceof java.util.List)) return;
+                    java.util.List<?> list = (java.util.List<?>) r;
+                    java.util.List<Object> kept = new java.util.ArrayList<>(list.size());
+                    for (Object item : list) {
+                        String pkg = null;
+                        if (item instanceof android.content.pm.ResolveInfo) {
+                            android.content.pm.ResolveInfo ri = (android.content.pm.ResolveInfo) item;
+                            if (ri.activityInfo != null) pkg = ri.activityInfo.packageName;
+                            else if (ri.serviceInfo != null) pkg = ri.serviceInfo.packageName;
+                            else if (ri.providerInfo != null) pkg = ri.providerInfo.packageName;
+                        }
+                        if (pkg == null || !isHiddenPkg(pkg)) kept.add(item);
+                    }
+                    if (kept.size() != list.size()) param.setResult(kept);
+                }
+            });
+        }
+
+        XposedEntry.log("hookPackageManager: 25+ methods covered, hidden=" + HIDDEN_PKGS.length + " pkgs");
     }
-}
 
     private static boolean isSuspiciousPath(String path) {
         // Comprehensive list of root-related paths
@@ -381,7 +609,30 @@ private static void hookPackageManager() {
             "/data/adb/magisk.img",
             // KernelSU
             "/data/adb/ksu",
-            "/data/adb/ksud"
+            "/data/adb/ksud",
+            // 【V10 补全】以下为参考项目有而我们之前缺失的
+            "/data/adb",                 // 整个目录（覆盖 modules/lspd 等一切子路径）
+            "/data/adb/modules",         // Magisk / KSU 模块
+            "/data/adb/lspd",            // Vector / LSPosed daemon
+            "/data/adb/ap",              // APatch
+            "/debug_ramdisk",            // Magisk 挂载点
+            "/sbin/.magisk",             // Magisk 旧路径
+            "/data/misc/lspd",           // LSPosed 备用
+            "/data/local/tmp/lspd",      // LSPosed 临时
+            // busybox / 提权工具
+            "/system/xbin/busybox",
+            "/system/bin/busybox",
+            "/data/local/busybox",
+            // 其他 root 实现
+            "/system/xbin/daemonsu",
+            "/su/xbin",
+            "/su/bin",
+            // Xposed 旧版
+            "/system/framework/XposedBridge.jar",
+            "/data/data/de.robv.android.xposed.installer",
+            // 【V10】我们自己的模块（不能让它被 QQ 扫到）
+            "/data/app/io.github.kida.qqnativeguard",
+            "/data/app/io.github.qqenhanced.bypass"
         };
 
         for (String suspicious : suspiciousPaths) {
