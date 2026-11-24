@@ -351,6 +351,39 @@ private static void hookLightDeviceRoot() {
             }
         }
 
+        // 【V11 实施】伪造 generateGuid 返回值。
+        //
+        // 依据（docs/GUID_SOURCE_EXPERIMENT.md）：三次单变量实验证明
+        // generateGuid() 不从任何存储读取，是运行时从硬件标识派生。
+        // 改 dat 文件 / MMKV / MSF 全部无效，只能 hook 函数本身。
+        //
+        // 注意：返回值是 byte[16]，必须与 FAKE_WLOGIN_GUID 的 32 hex 字符对应。
+        if (HookConfig.FAKE_WLOGIN_GUID != null && !HookConfig.FAKE_WLOGIN_GUID.isEmpty()) {
+            final byte[] fakeGuid = hexToBytes(HookConfig.FAKE_WLOGIN_GUID);
+            if (fakeGuid != null && fakeGuid.length == 16) {
+                HookUtils.hookAllMethods(cls, "generateGuid", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        Object r = param.getResult();
+                        if (r instanceof byte[]) {
+                            param.setResult(fakeGuid.clone());
+                        }
+                    }
+                });
+                // 可能还有带参数的重载
+                HookUtils.hookAllMethods(cls, "generateGuidForUser", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        Object r = param.getResult();
+                        if (r instanceof byte[]) {
+                            param.setResult(fakeGuid.clone());
+                        }
+                    }
+                });
+                XposedEntry.log("[WLOGIN-UTIL] generateGuid -> FAKED " + HookConfig.FAKE_WLOGIN_GUID);
+            }
+        }
+
         // save_* 方法：观察它把什么写到哪里（判断是否需要拦截落盘）
         HookUtils.hookAllMethods(cls, "saveGuid", new XC_MethodHook() {
             @Override
@@ -365,7 +398,21 @@ private static void hookLightDeviceRoot() {
         XposedEntry.log("[WLOGIN-UTIL] probe installed on " + cls);
     }
 
-    private static String renderValue(Object v) {
+        /** hex 字符串转 byte[]，用于 GUID 伪造 */
+    private static byte[] hexToBytes(String hex) {
+        if (hex == null || (hex.length() % 2) != 0) return null;
+        try {
+            byte[] out = new byte[hex.length() / 2];
+            for (int i = 0; i < out.length; i++) {
+                out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+            }
+            return out;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+private static String renderValue(Object v) {
         if (v == null) return "null";
         if (v instanceof byte[]) {
             byte[] b = (byte[]) v;
