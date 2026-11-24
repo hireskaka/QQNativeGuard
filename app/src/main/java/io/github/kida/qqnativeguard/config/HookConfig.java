@@ -98,6 +98,11 @@ public class HookConfig {
     // 直接伪造 Qimei SDK 返回给 QQ 的 qimei16/qimei36（服务端如果按 QIMEI 识别设备，
     // 换一个值就等于换设备）。留空 = 使用真实值。
     public static String FAKE_QIMEI36 = null;
+
+    /** 【V11】wlogin generateGuid 伪造值（32 hex chars = 16 字节）
+     *  依据：GUID 从存储读取无效，只能 hook 函数返回此值 */
+    public static String FAKE_WLOGIN_GUID = null;
+
     // OPPO OAID（com.heytap.openid 返回的匿名设备 ID）
     public static String FAKE_OAID = null;
 
@@ -187,6 +192,7 @@ public class HookConfig {
                 ROM_BUILD_DISPLAY = getString(props, "ROM_BUILD_DISPLAY", ROM_BUILD_DISPLAY);
                 ROM_BUILD_FINGERPRINT = getString(props, "ROM_BUILD_FINGERPRINT", ROM_BUILD_FINGERPRINT);
                 FAKE_QIMEI36 = getString(props, "FAKE_QIMEI36", FAKE_QIMEI36);
+        FAKE_WLOGIN_GUID = getString(props, "FAKE_WLOGIN_GUID", FAKE_WLOGIN_GUID);
                 FAKE_OAID = getString(props, "FAKE_OAID", FAKE_OAID);
                 ENV_SPOOF = getBool(props, "ENV_SPOOF", ENV_SPOOF);
                 ENV_RELEASE = getString(props, "ENV_RELEASE", ENV_RELEASE);
