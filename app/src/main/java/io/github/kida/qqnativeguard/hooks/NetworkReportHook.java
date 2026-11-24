@@ -32,10 +32,16 @@ public class NetworkReportHook {
         "trpc.o3.mobile_security",
         "trpc.ilive_cdn.report",
         "OidbSvc.0xd79",  // Device report
-        "wtlogin.device_lock",
+        // 【移除】wtlogin.device_lock —— 登录校验类命令，绝不能拦。
+        // 外部实证（WeChatTablet README changelog）：
+        //   误拦此命令会导致 "身份验证失败 (w21)"
+        // "wtlogin.device_lock",
         "turing",
         "riskCheckWup",
-        "DeviceTokenV3"
+        "DeviceTokenV3",
+        // 【移除】wtlogin.log_report —— 纯登录日志，拦截无收益且可能引发异常
+        // "wtlogin.log_report",
+        "QQStranger.login_svr.SsoLoginInfoReport",
     };
 
     /** 观测名单：这三条之前漏拦，先记录发送内容再决定拦截 */
