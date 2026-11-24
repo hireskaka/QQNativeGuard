@@ -1,0 +1,44 @@
+name: Build QQNativeGuard APK
+
+on:
+  workflow_dispatch: # 支持手动点击触发
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and Build Tools
+        run: |
+          yes | sdkmanager --install "ndk;27.3.13750724" "build-tools;36.0.0" "platforms;android-34" "cmake;3.22.1"
+
+      - name: Switch to official Gradle distribution (Avoid mirror timeout)
+        run: |
+          sed -i 's|mirrors.cloud.tencent.com/gradle|services.gradle.org/distributions|g' gradle/wrapper/gradle-wrapper.properties
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build APK with Gradle
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QQNativeGuard-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
